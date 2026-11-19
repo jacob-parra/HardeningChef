@@ -1,0 +1,102 @@
+{% set f = cfg.firewall %}
+{% set ssh_open = f.ports.ssh in (1, 3) %}
+# ------------------------------------------------------------------ firewall --
+hc_firewall() {
+  section "Firewall ({{ os.firewall }})"
+{% if not ssh_open %}
+  if (( HC_VIA_SSH && ! HC_FORCE )); then
+    err "This firewall does not allow SSH in, and you are connected over SSH. Refusing so you are not cut off (use --force to override)."
+    return 1
+  fi
+{% endif %}
+{% if os.firewall == "ufw" %}
+  pkg_install ufw
+  if (( HC_HAVE_SYSTEMD )) && systemctl is-active --quiet firewalld 2>/dev/null; then
+    warn "firewalld is also active; running two firewalls causes conflicts"
+  fi
+  # Start from a clean rule set so the result matches the website exactly.
+  run ufw --force reset
+  run ufw default deny incoming
+  run ufw default {{ f.default_outgoing }} outgoing
+{% for r in fw_rules %}
+{% if r.action in (1, 3) %}
+  run ufw allow in {{ r.ufw|q }} comment {{ ("HC " ~ r.label)|q }}
+{% endif %}
+{% if r.action in (2, 3) %}
+  run ufw allow out {{ r.ufw|q }} comment {{ ("HC " ~ r.label)|q }}
+{% endif %}
+{% if r.action == 4 %}
+  run ufw deny in {{ r.ufw|q }} comment {{ ("HC " ~ r.label)|q }}
+  run ufw deny out {{ r.ufw|q }} comment {{ ("HC " ~ r.label)|q }}
+{% endif %}
+{% endfor %}
+  run ufw logging {{ "low" if f.log_denied else "off" }}
+  run ufw --force enable
+  svc enable ufw
+  (( HC_APPLY )) && ufw status verbose | sed 's/^/            /'
+{% else %}
+  pkg_install firewalld
+  if (( HC_HAVE_SYSTEMD )) && systemctl is-active --quiet ufw 2>/dev/null; then
+    warn "ufw is also active; running two firewalls causes conflicts"
+  fi
+  (( HC_HAVE_SYSTEMD )) && svc enable --now firewalld
+
+  local ZONE=hardeningchef POL=hardeningchef-out online=0 x
+  firewall-cmd --state >/dev/null 2>&1 && online=1
+  # fw: permanent change (via the daemon if running, else offline). fwq: query.
+  fw()  { if (( online )); then run firewall-cmd -q --permanent "$@"; else run firewall-offline-cmd -q "$@"; fi; }
+  fwq() { if (( online )); then firewall-cmd --permanent "$@"; else firewall-offline-cmd "$@"; fi 2>/dev/null; }
+  (( online )) || info "firewalld is not running; writing the permanent configuration offline"
+
+  # A dedicated zone, so desktop zones that open high ports are not reused.
+  if fwq --get-zones | tr ' ' '\n' | grep -qx "$ZONE"; then
+    for x in $(fwq --zone="$ZONE" --list-services); do fw --zone="$ZONE" --remove-service="$x"; done
+    for x in $(fwq --zone="$ZONE" --list-ports);    do fw --zone="$ZONE" --remove-port="$x"; done
+    while IFS= read -r x; do [ -n "$x" ] && fw --zone="$ZONE" --remove-rich-rule="$x"; done < <(fwq --zone="$ZONE" --list-rich-rules)
+  else
+    fw --new-zone="$ZONE"
+  fi
+  fw --zone="$ZONE" --set-target=default
+{% for r in fw_rules %}
+{% if r.action in (1, 3) %}
+  fw --zone="$ZONE" --add-port={{ (r.port ~ "/" ~ r.proto)|q }}
+{% elif r.action == 4 %}
+  fw --zone="$ZONE" --add-rich-rule={{ ('rule port port="' ~ r.port ~ '" protocol="' ~ r.proto ~ '" reject')|q }}
+{% endif %}
+{% endfor %}
+
+  # Outgoing rules live in a policy from the host to anywhere.
+  fwq --get-policies | tr ' ' '\n' | grep -qx "$POL" && fw --delete-policy="$POL"
+{% set out_deny = f.default_outgoing == "deny" %}
+{% set egress = fw_rules | selectattr("action", "in", [2, 3, 4]) | list %}
+{% if out_deny or (egress | selectattr("action", "equalto", 4) | list) %}
+  fw --new-policy="$POL"
+  fw --policy="$POL" --add-ingress-zone=HOST
+  fw --policy="$POL" --add-egress-zone=ANY
+  fw --policy="$POL" --set-target={{ "REJECT" if out_deny else "CONTINUE" }}
+{% for r in egress %}
+{% if r.action in (2, 3) and out_deny %}
+  fw --policy="$POL" --add-port={{ (r.port ~ "/" ~ r.proto)|q }}
+{% elif r.action == 4 %}
+  fw --policy="$POL" --add-rich-rule={{ ('rule port port="' ~ r.port ~ '" protocol="' ~ r.proto ~ '" reject')|q }}
+{% endif %}
+{% endfor %}
+{% endif %}
+
+  if (( online )); then
+    run firewall-cmd -q --reload
+    [ "$(firewall-cmd --get-default-zone 2>/dev/null)" = "$ZONE" ] || run firewall-cmd -q --set-default-zone="$ZONE"
+    [ "$(firewall-cmd --get-log-denied 2>/dev/null)" = {{ ("all" if f.log_denied else "off")|q }} ] || run firewall-cmd -q --set-log-denied={{ "all" if f.log_denied else "off" }}
+    if (( HC_APPLY )); then
+      firewall-cmd --get-active-zones | sed 's/^/            /'
+      for x in $(firewall-cmd --get-active-zones | grep -v '^[[:space:]]' | grep -vx "$ZONE"); do
+        warn "zone '$x' has interfaces bound to it explicitly; they are not covered by these rules"
+      done
+    fi
+  else
+    [ "$(firewall-offline-cmd --get-default-zone 2>/dev/null)" = "$ZONE" ] || run firewall-offline-cmd -q --set-default-zone="$ZONE"
+    [ "$(firewall-offline-cmd --get-log-denied 2>/dev/null)" = {{ ("all" if f.log_denied else "off")|q }} ] || run firewall-offline-cmd -q --set-log-denied={{ "all" if f.log_denied else "off" }}
+  fi
+{% endif %}
+  return 0
+}

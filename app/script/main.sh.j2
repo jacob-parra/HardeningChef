@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  HardeningChef - OS hardening script
+#
+#  Target OS : {{ os.name }}
+#  Generated : {{ generated }}
+#  Catalog   : v{{ version }}
+#
+#  Usage
+#    sudo bash ./script.sh            audit only: shows what would change
+#    sudo bash ./script.sh --apply    make the changes
+#
+#  Options
+#    --apply   apply changes (default is a dry run that changes nothing)
+#    --yes     answer yes to confirmation prompts (for unattended runs)
+#    --force   run on an OS version other than the one this was built for,
+#              or apply a firewall that blocks SSH while connected over SSH
+#    --help    show this help
+#
+#  Every file changed is backed up under /var/backups/hardeningchef/<time>/
+#  and every action is logged to /var/log/hardeningchef.log.
+# =============================================================================
+# The line below records the selections this script was built from. Upload this
+# file to the HardeningChef website to load them back into the form.
+# HC-PROFILE: {{ profile_b64 }}
+
+set -uo pipefail
+umask 022
+
+# ----------------------------------------------------------------- arguments --
+HC_APPLY=0 HC_YES=0 HC_FORCE=0
+hc_usage() {
+  cat <<'HC_USAGE'
+HardeningChef hardening script for {{ os.name }}
+
+  sudo bash ./script.sh            audit only: shows what would change
+  sudo bash ./script.sh --apply    make the changes
+  curl -fsSL <link> | sudo bash -s -- --apply
+
+  --apply   apply changes (default is a dry run that changes nothing)
+  --yes     answer yes to confirmation prompts (for unattended runs)
+  --force   run on a different OS version than this was built for, or apply
+            a firewall that blocks SSH while connected over SSH
+HC_USAGE
+}
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply) HC_APPLY=1 ;;
+    --yes|-y) HC_YES=1 ;;
+    --force) HC_FORCE=1 ;;
+    -h|--help) hc_usage; exit 0 ;;
+    *) echo "Unknown option: $1 (try --help)" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# ------------------------------------------------------------------- helpers --
+HC_OS_NAME={{ os.name|q }}
+HC_FAMILY={{ os.family|q }}
+HC_TS=$(date +%Y%m%d-%H%M%S)
+HC_BACKUP_DIR="/var/backups/hardeningchef/$HC_TS"
+HC_LOG=/var/log/hardeningchef.log
+HC_CHANGES=0 HC_WARNINGS=0 HC_ERRORS=0 HC_REBOOT=0
+HC_HAVE_SYSTEMD=0; [ -d /run/systemd/system ] && HC_HAVE_SYSTEMD=1
+{% if os.family == "debian" %}
+export DEBIAN_FRONTEND=noninteractive
+{% endif %}
+
+if [ -t 1 ]; then
+  C_R=$'\e[31m' C_G=$'\e[32m' C_Y=$'\e[33m' C_B=$'\e[1;34m' C_0=$'\e[0m'
+else
+  C_R='' C_G='' C_Y='' C_B='' C_0=''
+fi
+
+_hc_log() { (( HC_APPLY )) && [ -w "$(dirname "$HC_LOG")" ] && printf '%s [%s] %s\n' "$(date -Is)" "$1" "$2" >>"$HC_LOG"; return 0; }
+section() { printf '\n%s== %s ==%s\n' "$C_B" "$1" "$C_0"; _hc_log SECTION "$1"; }
+info()    { printf '   %s\n' "$*"; _hc_log INFO "$*"; }
+ok()      { printf '   %sok%s     %s\n' "$C_G" "$C_0" "$*"; _hc_log OK "$*"; }
+warn()    { HC_WARNINGS=$((HC_WARNINGS+1)); printf '   %swarn%s   %s\n' "$C_Y" "$C_0" "$*"; _hc_log WARN "$*"; }
+err()     { HC_ERRORS=$((HC_ERRORS+1)); printf '   %serror%s  %s\n' "$C_R" "$C_0" "$*" >&2; _hc_log ERROR "$*"; }
+die()     { err "$*"; exit 1; }
+changed() {
+  HC_CHANGES=$((HC_CHANGES+1))
+  if (( HC_APPLY )); then printf '   %schange%s %s\n' "$C_B" "$C_0" "$*"; _hc_log CHANGE "$*"
+  else printf '   %swould%s  %s\n' "$C_Y" "$C_0" "$*"; fi
+}
+
+# run CMD...  - execute in apply mode, print in audit mode.
+run() {
+  local cmd; cmd=$(printf '%q ' "$@")
+  if (( HC_APPLY )); then
+    changed "${cmd% }"
+    "$@"; local rc=$?
+    (( rc == 0 )) || err "command failed (exit $rc): ${cmd% }"
+    return $rc
+  fi
+  changed "run: ${cmd% }"
+  return 0
+}
+
+backup_file() {
+  local f=$1
+  (( HC_APPLY )) || return 0
+  [ -e "$f" ] || return 0
+  [ -e "$HC_BACKUP_DIR$f" ] && return 0
+  mkdir -p "$HC_BACKUP_DIR$(dirname "$f")" && cp -a "$f" "$HC_BACKUP_DIR$f"
+}
+
+restore_file() {
+  local f=$1
+  if [ -e "$HC_BACKUP_DIR$f" ]; then cp -a "$HC_BACKUP_DIR$f" "$f"; else rm -f "$f"; fi
+}
+
+# write_file PATH [MODE]  - content on stdin. No-op when unchanged.
+write_file() {
+  local path=$1 mode=${2:-0644} tmp
+  tmp=$(mktemp) || { err "mktemp failed"; return 1; }
+  cat >"$tmp"
+  if [ -f "$path" ] && cmp -s "$tmp" "$path"; then
+    rm -f "$tmp"; ok "unchanged: $path"; return 0
+  fi
+  if (( HC_APPLY )); then
+    backup_file "$path"
+    mkdir -p "$(dirname "$path")"
+    if install -m "$mode" "$tmp" "$path"; then
+      command -v restorecon >/dev/null 2>&1 && restorecon -q "$path" 2>/dev/null
+      changed "wrote $path"
+    else
+      err "could not write $path"
+    fi
+  else
+    changed "write $path"
+    sed 's/^/            | /' "$tmp" | head -n 40
+  fi
+  rm -f "$tmp"
+}
+
+# set_kv FILE KEY VALUE [SEP]  - set "KEY<SEP>VALUE", replacing an active line,
+# else the first commented-out one, else appending.
+set_kv() {
+  local file=$1 key=$2 value=$3 sep=${4:- } mode=0644
+  [ -f "$file" ] && mode=$(stat -c %a "$file")
+  if [ -f "$file" ]; then
+    awk -v k="$key" -v line="$key$sep$value" '
+      function mk(s) { return s == k || index(s, k " ") == 1 || index(s, k "\t") == 1 || index(s, k "=") == 1 }
+      NR == FNR { s = $0; if ($0 !~ /^[ \t]*#/) { sub(/^[ \t]+/, "", s); if (mk(s)) active = 1 } next }
+      {
+        s = $0; c = ($0 ~ /^[ \t]*#/); sub(/^[ \t]*#?[ \t]*/, "", s)
+        if (mk(s)) {
+          if (!done && (active ? !c : c)) { print line; done = 1; next }
+          if (!c) next
+        }
+        print
+      }
+      END { if (!done) print line }' "$file" "$file"
+  else
+    printf '%s%s%s\n' "$key" "$sep" "$value"
+  fi | write_file "$file" "$mode"
+}
+
+hc_tty() { { : </dev/tty; } 2>/dev/null; }
+
+# confirm "question"  - yes with --yes, asks on a terminal, otherwise no.
+confirm() {
+  (( HC_APPLY )) || return 0
+  (( HC_YES )) && return 0
+  if hc_tty; then
+    local a; read -r -p "   $1 [y/N] " a </dev/tty
+    [[ $a =~ ^[Yy] ]]; return
+  fi
+  warn "skipped (needs confirmation; re-run with --yes): $1"
+  return 1
+}
+
+pkg_is_installed() {
+{% if os.family == "debian" %}
+  dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null | grep -q '^ii'
+{% else %}
+  rpm -q --quiet "$1" 2>/dev/null
+{% endif %}
+}
+
+{% if os.family == "debian" %}
+HC_PKG_REFRESHED=0
+{% endif %}
+pkg_install() {
+  local p missing=()
+  for p in "$@"; do pkg_is_installed "$p" || missing+=("$p"); done
+  if (( ${#missing[@]} == 0 )); then ok "installed: $*"; return 0; fi
+{% if os.family == "debian" %}
+  if (( HC_APPLY && ! HC_PKG_REFRESHED )); then run apt-get -o Acquire::Retries=3 update -q; HC_PKG_REFRESHED=1; fi
+  # Skip packages no enabled source offers (e.g. after removing "universe").
+  if (( HC_APPLY )); then
+    local avail=()
+    for p in "${missing[@]}"; do
+      case "$(apt-cache policy "$p" 2>/dev/null | awk '/Candidate:/ { print $2 }')" in
+        ""|"(none)") warn "$p is not available from the enabled APT sources; skipped" ;;
+        *) avail+=("$p") ;;
+      esac
+    done
+    (( ${#avail[@]} )) || return 0
+    missing=("${avail[@]}")
+  fi
+  run apt-get -o Acquire::Retries=3 install -y -q --no-install-recommends "${missing[@]}"
+{% else %}
+  run dnf install -y -q "${missing[@]}"
+{% endif %}
+}
+
+svc() {
+  if (( ! HC_HAVE_SYSTEMD )); then warn "systemd is not running; skipped: systemctl $*"; return 0; fi
+  run systemctl "$@"
+}
+
+home_of() { local h; h=$(getent passwd "$1" | cut -d: -f6); printf '%s' "${h:-/home/$1}"; }
+
+# Regular login accounts (UID >= 1000 with a real shell).
+human_users() {
+  getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 && $7 !~ /(nologin|false|sync|halt|shutdown)$/ { print $1 }'
+}
+
+in_list() { local x=$1; shift; local y; for y in "$@"; do [ "$x" = "$y" ] && return 0; done; return 1; }
+
+# ----------------------------------------------------------------- preflight --
+section "Preflight"
+[ -r /etc/os-release ] || die "/etc/os-release not found; cannot identify this system."
+HC_ID=$(. /etc/os-release; printf '%s' "${ID:-}")
+HC_VER=$(. /etc/os-release; printf '%s' "${VERSION_ID:-}")
+HC_LIKE=$(. /etc/os-release; printf '%s' "${ID_LIKE:-}")
+HC_PRETTY=$(. /etc/os-release; printf '%s' "${PRETTY_NAME:-$HC_ID}")
+info "Detected: $HC_PRETTY"
+info "Built for: $HC_OS_NAME"
+
+case " $HC_ID $HC_LIKE " in
+  *" debian "*|*" ubuntu "*|*" kali "*) HC_DETECTED_FAMILY=debian ;;
+  *" fedora "*|*" rhel "*|*" rocky "*|*" centos "*|*" almalinux "*) HC_DETECTED_FAMILY=rhel ;;
+  *) HC_DETECTED_FAMILY=unknown ;;
+esac
+HC_EXPECT_ID={{ os.os_release.id|q }}
+HC_EXPECT_VER={{ os.os_release.version|q }}
+HC_OS_MATCH=0
+if [ "$HC_ID" = "$HC_EXPECT_ID" ]; then
+  if [ -z "$HC_EXPECT_VER" ]; then HC_OS_MATCH=1
+  else case "$HC_VER" in "$HC_EXPECT_VER"|"$HC_EXPECT_VER".*) HC_OS_MATCH=1 ;; esac
+  fi
+fi
+if (( HC_OS_MATCH )); then
+  ok "operating system matches"
+elif [ "$HC_DETECTED_FAMILY" != "$HC_FAMILY" ]; then
+  die "This script is for the $HC_FAMILY family, but this system is '$HC_PRETTY'. Generate a script for this OS instead."
+elif (( HC_FORCE )); then
+  warn "OS/version differs from the target; continuing because of --force"
+else
+  die "This script was built for $HC_OS_NAME but this system is '$HC_PRETTY'. Re-run with --force to proceed anyway."
+fi
+
+if (( HC_APPLY )); then
+  [ "$(id -u)" -eq 0 ] || die "Applying changes needs root. Re-run with sudo."
+  mkdir -p "$HC_BACKUP_DIR" || die "cannot create $HC_BACKUP_DIR"
+  touch "$HC_LOG" && chmod 600 "$HC_LOG"
+  info "Mode: ${C_R}APPLY${C_0} (backups in $HC_BACKUP_DIR)"
+else
+  info "Mode: ${C_Y}AUDIT / DRY RUN${C_0} - nothing will be changed. Re-run with --apply to apply."
+  [ "$(id -u)" -eq 0 ] || warn "not running as root; some checks will be incomplete"
+fi
+
+# Who is running this, and are they connected over SSH? (sudo hides SSH_CONNECTION.)
+HC_INVOKER=${SUDO_USER:-}
+[ -z "$HC_INVOKER" ] && HC_INVOKER=$(logname 2>/dev/null || true)
+[ "$HC_INVOKER" = root ] && HC_INVOKER=""
+HC_VIA_SSH=0
+hc_pid=$$
+while [ "${hc_pid:-0}" -gt 1 ] 2>/dev/null; do
+  case "$(cat "/proc/$hc_pid/comm" 2>/dev/null)" in sshd|sshd-session|sshd-auth) HC_VIA_SSH=1; break ;; esac
+  hc_pid=$(awk '/^PPid:/ { print $2 }' "/proc/$hc_pid/status" 2>/dev/null)
+done
+(( HC_VIA_SSH )) && info "Connected over SSH${HC_INVOKER:+ as $HC_INVOKER}"
+
+HC_ADMIN_GROUP={{ os.admin_group|q }}
+{% if cfg.accounts is defined and cfg.accounts.enabled %}
+HC_ADMINS=({{ cfg.accounts.all_admins|qlist }})
+HC_PENDING_KEYS={{ 1 if (cfg.accounts.new_admin_user and cfg.accounts.new_admin_keys) else 0 }}
+{% else %}
+HC_ADMINS=()
+HC_PENDING_KEYS=0
+{% endif %}
+for hc_m in $(getent group "$HC_ADMIN_GROUP" | cut -d: -f4 | tr ',' ' '); do
+  in_list "$hc_m" "${HC_ADMINS[@]}" || HC_ADMINS+=("$hc_m")
+done
+
+{% for name in ["accounts", "ssh", "firewall", "apparmor", "selinux", "logging", "packages"] %}
+{% if cfg[name] is defined and cfg[name].enabled %}
+{% include "sections/" ~ name ~ ".sh.j2" %}
+
+{% endif %}
+{% endfor %}
+# ------------------------------------------------------------------- run it --
+{% for name in ["accounts", "ssh", "firewall", "apparmor", "selinux", "logging", "packages"] %}
+{% if cfg[name] is defined and cfg[name].enabled %}
+hc_{{ name }} || err "section '{{ name }}' did not complete"
+{% endif %}
+{% endfor %}
+
+# ------------------------------------------------------------------- summary --
+section "Summary"
+if (( HC_APPLY )); then
+  info "Changes made: $HC_CHANGES   Warnings: $HC_WARNINGS   Errors: $HC_ERRORS"
+  info "Backups: $HC_BACKUP_DIR"
+  info "Log:     $HC_LOG"
+  (( HC_REBOOT )) && warn "A reboot is required for some changes to take effect."
+else
+  info "Changes that would be made: $HC_CHANGES   Warnings: $HC_WARNINGS"
+  info "Nothing was changed. Re-run with --apply to apply."
+fi
+(( HC_ERRORS == 0 ))

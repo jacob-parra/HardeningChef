@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HardeningChef</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <div class="wrap top-inner">
+      <div class="brand">
+        <img src="/static/favicon.svg" alt="" width="28" height="28">
+        <span>HardeningChef</span>
+      </div>
+      <div class="top-actions">
+        <label class="btn ghost" for="import-file">Import profile</label>
+        <input id="import-file" type="file" accept=".json,.sh,application/json,text/plain" hidden>
+        <button class="btn ghost" id="reset-btn" type="button">Reset to defaults</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="intro">
+      <h1>Build a hardening script for a new Linux machine</h1>
+      <p>Pick the operating system, adjust the settings, and download a script, or fetch it with
+        <code>curl</code> on the target machine. Scripts run as a dry run by default and only change
+        anything when run with <code>--apply</code>.</p>
+    </section>
+
+    <section aria-labelledby="os-h">
+      <h2 id="os-h" class="step"><span>1</span> Operating system</h2>
+      <div id="os-list" class="os-list" role="radiogroup"></div>
+    </section>
+
+    <section aria-labelledby="cfg-h">
+      <h2 id="cfg-h" class="step"><span>2</span> Settings</h2>
+      <div id="sections"></div>
+    </section>
+
+    <section aria-labelledby="build-h" class="build">
+      <h2 id="build-h" class="step"><span>3</span> Build</h2>
+      <div class="build-row">
+        <button class="btn primary" id="build-btn" type="button">Build script</button>
+        <label class="inline-check" id="share-wrap"><input type="checkbox" id="share-chk" checked>
+          <span>Also create a temporary <code>curl</code> link</span></label>
+      </div>
+      <div id="errors" class="errors" hidden></div>
+      <div id="result" class="result" hidden>
+        <div id="warnings"></div>
+        <div class="result-grid">
+          <div class="card">
+            <h3>Download</h3>
+            <p class="muted" id="res-filename"></p>
+            <div class="btn-row">
+              <button class="btn primary" id="dl-script" type="button">Download .sh</button>
+              <button class="btn" id="dl-profile" type="button">Download profile (.json)</button>
+            </div>
+            <p class="muted small">SHA-256 <code id="res-sha" class="break"></code></p>
+          </div>
+          <div class="card" id="share-card" hidden>
+            <h3>Run with curl <span class="pill" id="countdown"></span></h3>
+            <p class="muted small">Dry run first, then apply. The link stops working when the timer runs out.</p>
+            <div class="cmd"><code id="cmd-audit"></code><button class="btn tiny" data-copy="cmd-audit" type="button">Copy</button></div>
+            <div class="cmd"><code id="cmd-apply"></code><button class="btn tiny" data-copy="cmd-apply" type="button">Copy</button></div>
+            <details class="small">
+              <summary>Verify before running</summary>
+              <div class="cmd"><code id="cmd-verify"></code><button class="btn tiny" data-copy="cmd-verify" type="button">Copy</button></div>
+            </details>
+          </div>
+        </div>
+        <details class="preview">
+          <summary>Preview script</summary>
+          <pre id="res-script"></pre>
+        </details>
+      </div>
+    </section>
+  </main>
+
+  <footer class="wrap foot muted small">
+    <span id="foot-version"></span>
+  </footer>
+</body>
+</html>
