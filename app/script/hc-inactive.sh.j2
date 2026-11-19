@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# HardeningChef: expire non-admin accounts with no login in {{ cfg.accounts.inactivity_days }} days.
+# Installed by the HardeningChef hardening script; runs daily from
+# hc-inactive-accounts.timer. Use --report to list without changing anything.
+set -uo pipefail
+DAYS={{ cfg.accounts.inactivity_days }}
+ADMIN_GROUP={{ os.admin_group|q }}
+EXEMPT=({{ cfg.accounts.all_admins|qlist }})
+REPORT=0; [ "${1:-}" = "--report" ] && REPORT=1
+now=$(date +%s)
+
+# Last login as epoch seconds, from lastlog2 (current distros) or lastlog.
+last_login() {
+  local u=$1 t=""
+  if [ -r /var/lib/lastlog/lastlog2.db ] && command -v sqlite3 >/dev/null 2>&1; then
+    t=$(sqlite3 /var/lib/lastlog/lastlog2.db "SELECT Time FROM Lastlog2 WHERE Name='$u';" 2>/dev/null)
+  fi
+  if [ -z "$t" ] && command -v lastlog2 >/dev/null 2>&1; then
+    t=$(lastlog2 -u "$u" 2>/dev/null | awk 'NR==2 && !/Never/ { print $(NF-5), $(NF-4), $(NF-3), $(NF-2), $(NF-1), $NF }')
+    [ -n "$t" ] && t=$(date -d "$t" +%s 2>/dev/null)
+  fi
+  if [ -z "$t" ] && command -v lastlog >/dev/null 2>&1; then
+    t=$(lastlog -u "$u" 2>/dev/null | awk 'NR==2 && !/Never/ { print $(NF-5), $(NF-4), $(NF-3), $(NF-2), $(NF-1), $NF }')
+    [ -n "$t" ] && t=$(date -d "$t" +%s 2>/dev/null)
+  fi
+  printf '%s' "$t"
+}
+
+getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 && $7 !~ /(nologin|false)$/ { print $1 }' |
+while read -r user; do
+  id -nG "$user" | tr ' ' '\n' | grep -qx "$ADMIN_GROUP" && continue
+  for e in "${EXEMPT[@]}"; do [ "$user" = "$e" ] && continue 2; done
+  IFS=: read -r _ _ lastchg _ _ _ _ expire _ < <(getent shadow "$user")
+  [ -n "$expire" ] && [ "$expire" -le $((now / 86400)) ] 2>/dev/null && continue   # already expired
+  last=$(last_login "$user")
+  if [ -z "$last" ] || [ "$last" = 0 ]; then
+    # Never logged in: measure from the last password change instead.
+    [[ ${lastchg:-} =~ ^[0-9]+$ ]] && (( lastchg > 0 )) || continue
+    last=$((lastchg * 86400))
+  fi
+  idle=$(( (now - last) / 86400 ))
+  (( idle > DAYS )) || continue
+  if (( REPORT )); then
+    echo "$user (inactive $idle days)"
+  else
+    usermod -e 1 "$user" && logger -t hc-inactive "expired $user after $idle days without login"
+  fi
+done

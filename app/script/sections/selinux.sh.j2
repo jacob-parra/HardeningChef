@@ -1,0 +1,39 @@
+{% set s = cfg.selinux %}
+# ------------------------------------------------------------------- selinux --
+hc_selinux() {
+  section "SELinux"
+{% if s.install_tools %}
+  pkg_install policycoreutils policycoreutils-python-utils selinux-policy-targeted libselinux-utils
+{% endif %}
+
+{% if s.mode != "unchanged" %}
+  local want={{ s.mode|q }} current
+  current=$(getenforce 2>/dev/null || echo Disabled)
+  info "current mode: $current"
+  if [ "$current" = Disabled ]; then
+    # Since Fedora 34 / EL9, SELinux is disabled with the selinux=0 kernel
+    # argument, not in /etc/selinux/config. Turning it back on needs a full
+    # relabel. Red Hat recommends booting permissive first, so that is done here.
+    warn "SELinux is disabled. Re-enabling it: kernel argument removed, filesystem relabel at next boot."
+    command -v grubby >/dev/null 2>&1 && run grubby --update-kernel ALL --remove-args "selinux enforcing"
+    set_kv /etc/selinux/config SELINUX permissive "="
+    run touch /.autorelabel
+    HC_REBOOT=1
+    [ "$want" = enforcing ] && warn "After the reboot and relabel, run this script again to switch to enforcing."
+  else
+    set_kv /etc/selinux/config SELINUX "$want" "="
+    if [ "$want" = enforcing ] && [ "$current" != Enforcing ]; then run setenforce 1
+    elif [ "$want" = permissive ] && [ "$current" != Permissive ]; then run setenforce 0
+    else ok "SELinux is already $current"
+    fi
+  fi
+{% endif %}
+
+{% if s.show_status %}
+  if command -v sestatus >/dev/null 2>&1; then
+    info "SELinux status:"
+    sestatus 2>&1 | sed 's/^/            /'
+  fi
+{% endif %}
+  return 0
+}

@@ -1,0 +1,73 @@
+# Target operating systems.
+#
+# `family` selects which implementation the generator uses:
+#   debian -> APT, AppArmor, ufw, "sudo" group, ssh.service
+#   rhel   -> DNF, SELinux, firewalld, "wheel" group, sshd.service
+#
+# `os_release` is matched against /etc/os-release on the target at run time.
+# `version` is a prefix match on VERSION_ID (empty = any, for rolling releases).
+
+ubuntu-26.04:
+  name: Ubuntu 26.04 LTS
+  family: debian
+  os_release: {id: ubuntu, version: "26.04"}
+  ssh_service: ssh
+  admin_group: sudo
+  firewall: ufw
+  mac: apparmor
+  fuse2_packages: [libfuse2t64, libfuse2]
+  optional_components: [universe, multiverse, restricted]
+  sources_hint: "ubuntu.sources, docker.list, google-chrome.list"
+  primary_sources: [ubuntu.sources, sources.list]
+
+debian-13:
+  name: Debian 13 "Trixie"
+  family: debian
+  os_release: {id: debian, version: "13"}
+  ssh_service: ssh
+  admin_group: sudo
+  firewall: ufw
+  mac: apparmor
+  fuse2_packages: [libfuse2t64, libfuse2]
+  optional_components: [contrib, non-free, non-free-firmware]
+  sources_hint: "debian.sources, sources.list, docker.list"
+  primary_sources: [debian.sources, sources.list]
+
+kali-rolling:
+  name: Kali Rolling 2026.3
+  family: debian
+  os_release: {id: kali, version: ""}
+  ssh_service: ssh
+  admin_group: sudo
+  firewall: ufw
+  mac: apparmor
+  fuse2_packages: [libfuse2t64, libfuse2]
+  optional_components: [contrib, non-free, non-free-firmware]
+  sources_hint: "sources.list, kali.sources"
+  primary_sources: [sources.list, kali.sources]
+
+fedora-45:
+  name: Fedora 45
+  family: rhel
+  os_release: {id: fedora, version: "45"}
+  ssh_service: sshd
+  admin_group: wheel
+  firewall: firewalld
+  mac: selinux
+  fuse2_packages: [fuse-libs]
+  optional_components: []
+  sources_hint: "fedora-cisco-openh264, updates-testing, google-chrome"
+  primary_sources: [fedora, updates]
+
+rocky-10:
+  name: Rocky Linux 10.2
+  family: rhel
+  os_release: {id: rocky, version: "10"}
+  ssh_service: sshd
+  admin_group: wheel
+  firewall: firewalld
+  mac: selinux
+  fuse2_packages: [fuse-libs]
+  optional_components: []
+  sources_hint: "epel, crb, extras"
+  primary_sources: [baseos, appstream]

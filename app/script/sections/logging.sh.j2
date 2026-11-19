@@ -1,0 +1,31 @@
+{% set l = cfg.logging %}
+# ------------------------------------------------------------------- logging --
+hc_logging() {
+  section "Logging"
+{% if l.persistent_journal %}
+  if [ -d /var/log/journal ]; then ok "journal directory exists (/var/log/journal)"; else run mkdir -p /var/log/journal; fi
+  write_file /etc/systemd/journald.conf.d/hardeningchef.conf <<'HC_EOF'
+# Managed by HardeningChef: keep logs across reboots.
+[Journal]
+Storage=persistent
+HC_EOF
+  (( HC_HAVE_SYSTEMD )) && run systemctl restart systemd-journald
+{% endif %}
+
+{% if l.install_rsyslog %}
+  pkg_install rsyslog
+  svc enable --now rsyslog
+{% endif %}
+
+{% if l.install_viewer %}
+{% if os.family == "debian" %}
+  pkg_install whiptail less
+{% else %}
+  pkg_install newt less
+{% endif %}
+  write_file /usr/local/bin/hc-logs 0755 <<'HC_LOGS_EOF'
+{{ hc_logs }}HC_LOGS_EOF
+  info "Run 'sudo hc-logs' to browse the system's logs."
+{% endif %}
+  return 0
+}

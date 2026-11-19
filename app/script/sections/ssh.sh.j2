@@ -1,0 +1,95 @@
+{% set s = cfg.ssh %}
+{% macro yn(v) %}{{ "yes" if v else "no" }}{% endmacro %}
+# ----------------------------------------------------------------------- ssh --
+hc_ssh() {
+  section "SSH"
+  local SVC={{ os.ssh_service|q }} SSHD MAIN=/etc/ssh/sshd_config
+  local DROPIN=/etc/ssh/sshd_config.d/00-hardeningchef.conf
+  SSHD=$(command -v sshd 2>/dev/null || echo /usr/sbin/sshd)
+
+  if [ ! -x "$SSHD" ]; then
+{% if s.install_server %}
+    pkg_install openssh-server
+{% else %}
+    warn "OpenSSH server is not installed; SSH hardening skipped"
+    return 0
+{% endif %}
+  fi
+
+  # Never disable password login unless an admin can still get in with a key.
+  local pass_auth=no keyed="" u home
+  for u in "${HC_ADMINS[@]}" "$HC_INVOKER"; do
+    [ -n "$u" ] || continue
+    home=$(home_of "$u")
+    [ -s "$home/.ssh/authorized_keys" ] && ! in_list "$u" $keyed && keyed="$keyed $u"
+  done
+  if [ -n "$keyed" ]; then
+    ok "authorized SSH keys found for:$keyed"
+  elif (( HC_PENDING_KEYS )); then
+    ok "SSH keys for the new admin account are installed by this script"
+  else
+    pass_auth=yes
+    warn "No admin user has an authorized SSH key, so PasswordAuthentication stays ON to avoid locking you out. Add a key (ssh-copy-id) and re-run."
+  fi
+
+  # Drop-ins only win if the Include comes before other settings in sshd_config.
+  if [ -f "$MAIN" ] && ! grep -qiE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "$MAIN"; then
+    { echo 'Include /etc/ssh/sshd_config.d/*.conf'; cat "$MAIN"; } | write_file "$MAIN" "$(stat -c %a "$MAIN")"
+  fi
+
+  printf '%s\n' {{ s.banner_text|q }} | write_file /etc/issue.net 0644
+
+  # OpenSSH uses the first value it reads, and 00- sorts before distro and
+  # cloud-init drop-ins (50-redhat.conf, 50-cloud-init.conf).
+  write_file "$DROPIN" 0600 <<HC_EOF
+# Managed by HardeningChef. Local changes will be overwritten on re-run.
+PermitRootLogin no
+PubkeyAuthentication yes
+PasswordAuthentication $pass_auth
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+HostbasedAuthentication no
+IgnoreRhosts yes
+MaxAuthTries {{ s.max_auth_tries }}
+LoginGraceTime {{ s.login_grace_time }}
+MaxStartups {{ s.max_startups }}
+MaxSessions {{ s.max_sessions }}
+ClientAliveInterval {{ s.client_alive_interval }}
+ClientAliveCountMax {{ s.client_alive_count_max }}
+LogLevel VERBOSE
+Banner /etc/issue.net
+X11Forwarding {{ yn(s.x11_forwarding) }}
+AllowTcpForwarding {{ yn(s.tcp_forwarding) }}
+AllowAgentForwarding {{ yn(s.agent_forwarding) }}
+PermitTunnel no
+GatewayPorts no
+PermitUserEnvironment no
+HC_EOF
+
+  (( HC_APPLY )) || { info "sshd -t validation and service reload happen in --apply mode"; return 0; }
+
+  ls /etc/ssh/ssh_host_*_key >/dev/null 2>&1 || run ssh-keygen -A
+  local out
+  if ! out=$("$SSHD" -t 2>&1); then
+    err "sshd rejected the new configuration; restoring the previous one:"
+    printf '%s\n' "$out" | sed 's/^/            /' >&2
+    restore_file "$DROPIN"
+    return 1
+  fi
+  ok "sshd -t: configuration is valid"
+
+  if (( ! HC_HAVE_SYSTEMD )); then
+    warn "systemd is not running; restart $SVC yourself to load the new settings"
+  elif systemctl is-active --quiet "$SVC"; then
+    run systemctl reload "$SVC"
+  elif systemctl is-active --quiet ssh.socket 2>/dev/null; then
+    ok "ssh is socket-activated; new connections use the new settings"
+  else
+{% if s.install_server %}
+    run systemctl enable --now "$SVC"
+{% else %}
+    info "$SVC is not running; settings apply when it starts"
+{% endif %}
+  fi
+  return 0
+}

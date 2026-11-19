@@ -1,0 +1,53 @@
+{% set a = cfg.apparmor %}
+# ------------------------------------------------------------------ apparmor --
+aa_profile_path() {
+  case "$1" in /*) printf '%s' "$1" ;; *) printf '/etc/apparmor.d/%s' "$1" ;; esac
+}
+
+hc_apparmor() {
+  section "AppArmor"
+{% if a.install_core %}
+  pkg_install apparmor apparmor-utils
+{% endif %}
+{% if a.install_extra %}
+  pkg_install apparmor-profiles apparmor-profiles-extra
+{% endif %}
+
+{% if a.enable_boot %}
+  if grep -qw apparmor /sys/kernel/security/lsm 2>/dev/null; then
+    ok "AppArmor is active in the running kernel; GRUB left unchanged"
+  elif [ -f /etc/default/grub ]; then
+    write_file /etc/default/grub.d/99-hardeningchef-apparmor.cfg <<'HC_EOF'
+# Managed by HardeningChef: enable AppArmor at boot.
+GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT apparmor=1 security=apparmor"
+HC_EOF
+    if command -v update-grub >/dev/null 2>&1; then run update-grub; else run grub-mkconfig -o /boot/grub/grub.cfg; fi
+    HC_REBOOT=1
+  else
+    warn "GRUB not found (container, or another bootloader); add 'apparmor=1 security=apparmor' to the kernel command line yourself"
+  fi
+{% endif %}
+
+{% if a.start_service %}
+  svc enable --now apparmor
+{% endif %}
+
+  local path=""
+{% for prof in a.enforce_profiles %}
+  path=$(aa_profile_path {{ prof|q }})
+  if [ -f "$path" ]; then run aa-enforce "$path"; else warn "AppArmor profile $path not found; skipped"; fi
+{% endfor %}
+{% for prof in a.complain_profiles %}
+  path=$(aa_profile_path {{ prof|q }})
+  if [ -f "$path" ]; then run aa-complain "$path"; else warn "AppArmor profile $path not found; skipped"; fi
+{% endfor %}
+  : "$path"
+
+{% if a.show_status %}
+  if command -v aa-status >/dev/null 2>&1; then
+    info "AppArmor status:"
+    aa-status 2>&1 | head -n 30 | sed 's/^/            /'
+  fi
+{% endif %}
+  return 0
+}

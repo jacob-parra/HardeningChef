@@ -1,0 +1,462 @@
+# Hardening sections, transcribed from the team's "Multi-OS Hardening Script
+# Recipe Builder" document. The website form and the script generator are both
+# driven from this file.
+#
+# Section keys:
+#   families : which OS families the section applies to (debian / rhel)
+#   fixed    : settings that are always applied and not user-changeable
+#   options  : user-changeable settings
+#
+# Option keys:
+#   type     : bool | int | text | textarea | choice | multichoice | list | portmap
+#   default  : default value
+#   families : (optional) restrict the option to one OS family
+#   requires : (optional) id of a bool option in the same section that must be on
+#   pattern  : (text/list) regex each value must fully match
+#   danger   : (optional) flag shown in the UI for options that can break things
+#   why      : justification from the research document
+
+- id: accounts
+  title: User Accounts & Privileges
+  intro: >
+    Restricts administrator access, locks accounts after repeated failed
+    logins, and enforces password age, length, and inactivity rules. If root is
+    the only account on the machine, the script offers to create one.
+  families: [debian, rhel]
+  options:
+    - id: enabled
+      label: Apply account and privilege hardening
+      type: bool
+      default: true
+
+    - id: new_admin_user
+      label: Create this admin account if it does not exist
+      type: text
+      default: ""
+      pattern: "[a-z_][a-z0-9_-]{0,31}"
+      placeholder: e.g. opsadmin
+      help: >
+        Optional. The account is created and added to the admin group. Leave
+        blank and the script will prompt for one only if root is the only user.
+
+    - id: new_admin_keys
+      label: SSH public keys for that account (one per line)
+      type: list
+      default: []
+      pattern: "(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\\.com|sk-ecdsa-sha2-nistp256@openssh\\.com) [A-Za-z0-9+/]+={0,3}( [A-Za-z0-9@._+:-]{1,100})?"
+      placeholder: ssh-ed25519 AAAA... you@laptop
+      help: >
+        Strongly recommended: SSH password login is disabled, so an admin
+        needs a key to get back in.
+
+    - id: admin_users
+      label: Administrator users (comma or newline separated)
+      type: list
+      default: []
+      pattern: "[a-z_][a-z0-9_-]{0,31}"
+      placeholder: alice, bob
+      help: >
+        These users are added to the admin group (sudo on Debian-family,
+        wheel on Fedora/Rocky). The new admin account above is included
+        automatically.
+
+    - id: restrict_sudo
+      label: Remove everyone else from the admin group
+      type: bool
+      default: true
+      why: Choose admin users and restrict sudo to those users.
+      help: >
+        The user running the script is never removed, and nothing is removed
+        if no admin users are listed.
+
+    - id: lockout
+      label: Lock accounts after failed logins (pam_faillock)
+      type: bool
+      default: true
+      why: Slows down password guessing against local and console logins.
+
+    - id: lockout_attempts
+      label: Failed attempts before lockout
+      type: int
+      default: 5
+      min: 1
+      max: 20
+      requires: lockout
+
+    - id: lockout_minutes
+      label: Lockout duration (minutes)
+      type: int
+      default: 15
+      min: 1
+      max: 1440
+      requires: lockout
+
+    - id: min_password_length
+      label: Minimum password length
+      type: int
+      default: 14
+      min: 8
+      max: 128
+
+    - id: max_password_age
+      label: Maximum password age (days)
+      type: int
+      default: 180
+      min: 1
+      max: 9999
+
+    - id: password_age_existing
+      label: Also apply the maximum age to existing users
+      type: bool
+      default: true
+      help: Users whose password is already older than the limit must change it at next login.
+
+    - id: disable_inactive
+      label: Disable inactive non-admin accounts
+      type: bool
+      default: true
+      help: Installs a daily systemd timer that expires accounts with no login in the period below.
+
+    - id: inactivity_days
+      label: Inactivity period (days)
+      type: int
+      default: 180
+      min: 7
+      max: 3650
+      requires: disable_inactive
+
+    - id: umask
+      label: Default file permission mask (umask)
+      type: choice
+      default: "077"
+      choices:
+        - {value: "077", label: "077 - owner only (most restrictive)"}
+        - {value: "027", label: "027 - owner rw, group read"}
+        - {value: "022", label: "022 - distribution default"}
+      help: Applies to login shells and PAM sessions. System services are unaffected.
+
+- id: ssh
+  title: SSH
+  intro: >
+    Writes a high-priority drop-in config (sshd_config.d/00-hardeningchef.conf)
+    so the hardened values override distribution and cloud-init defaults, then
+    validates with `sshd -t` and reloads the right service for the OS.
+  families: [debian, rhel]
+  fixed:
+    - {setting: PermitRootLogin, value: "no", why: Being able to remote in as root is not practically needed and is a large security risk.}
+    - {setting: PasswordAuthentication, value: "no", why: "Authenticating with SSH keys is much more secure than passwords. Left on (with a warning) if no admin has an authorized key, so you cannot be locked out."}
+    - {setting: KbdInteractiveAuthentication, value: "no", why: Closes the PAM keyboard-interactive path that still accepts passwords when PasswordAuthentication is off.}
+    - {setting: PubkeyAuthentication, value: "yes"}
+    - {setting: PermitEmptyPasswords, value: "no"}
+    - {setting: HostbasedAuthentication, value: "no"}
+    - {setting: IgnoreRhosts, value: "yes"}
+    - {setting: LogLevel, value: VERBOSE, why: Records which key fingerprint was used to log in, which helps in incident response.}
+    - {setting: Banner, value: /etc/issue.net, why: Shows a custom remote-login warning banner.}
+    - {setting: PermitTunnel, value: "no"}
+    - {setting: GatewayPorts, value: "no"}
+    - {setting: PermitUserEnvironment, value: "no"}
+  options:
+    - id: enabled
+      label: Apply SSH hardening
+      type: bool
+      default: true
+
+    - id: install_server
+      label: Install and enable the OpenSSH server if missing
+      type: bool
+      default: false
+      help: Kali does not run an SSH server by default.
+
+    - id: max_auth_tries
+      label: MaxAuthTries
+      type: int
+      default: 3
+      min: 1
+      max: 10
+      why: Helps prevent brute-force attacks.
+
+    - id: login_grace_time
+      label: LoginGraceTime (seconds)
+      type: int
+      default: 30
+      min: 10
+      max: 600
+
+    - id: max_startups
+      label: MaxStartups
+      type: text
+      default: "10:30:60"
+      pattern: "[0-9]{1,4}(:[0-9]{1,3}:[0-9]{1,4})?"
+
+    - id: max_sessions
+      label: MaxSessions
+      type: int
+      default: 3
+      min: 1
+      max: 64
+
+    - id: client_alive_interval
+      label: ClientAliveInterval (seconds)
+      type: int
+      default: 300
+      min: 0
+      max: 3600
+      why: Removes old, stale sessions.
+
+    - id: client_alive_count_max
+      label: ClientAliveCountMax
+      type: int
+      default: 2
+      min: 0
+      max: 10
+
+    - id: x11_forwarding
+      label: Allow X11 forwarding
+      type: bool
+      default: false
+      why: Most SSH servers do not need forwarding, so defaulting to off closes possible gaps.
+
+    - id: tcp_forwarding
+      label: Allow TCP forwarding
+      type: bool
+      default: false
+
+    - id: agent_forwarding
+      label: Allow agent forwarding
+      type: bool
+      default: false
+
+    - id: banner_text
+      label: Login warning banner
+      type: textarea
+      default: "Authorized access only. All activity on this system may be monitored and recorded."
+      maxlength: 1000
+
+- id: firewall
+  title: Firewall
+  intro: >
+    Incoming traffic is denied by default. Choose what to do with each common
+    port. Debian, Ubuntu and Kali use ufw. Fedora and Rocky use firewalld,
+    their native firewall, with the same choices mapped onto a dedicated zone.
+  families: [debian, rhel]
+  options:
+    - id: enabled
+      label: Configure the firewall
+      type: bool
+      default: true
+
+    - id: default_outgoing
+      label: Default outgoing policy
+      type: choice
+      default: allow
+      choices:
+        - {value: allow, label: "Allow (recommended)"}
+        - {value: deny, label: "Deny - only ports marked 'allow out' can leave"}
+      help: With "deny", remember to allow DNS (and HTTP/HTTPS for package updates) out.
+
+    - id: ports
+      label: Port rules
+      type: portmap
+      default: {ssh: 1}
+      ports:
+        - {id: ssh, label: SSH, spec: [22/tcp]}
+        - {id: http, label: HTTP, spec: [80/tcp]}
+        - {id: https, label: HTTPS, spec: [443/tcp]}
+        - {id: dns, label: DNS, spec: [53/tcp, 53/udp]}
+        - {id: ftp, label: FTP, spec: [21/tcp]}
+        - {id: smtp, label: SMTP, spec: [25/tcp]}
+        - {id: mysql, label: MySQL, spec: [3306/tcp]}
+        - {id: postgresql, label: PostgreSQL, spec: [5432/tcp]}
+        - {id: rdp, label: RDP, spec: [3389/tcp]}
+        - {id: http_alt, label: Alt HTTP (8080), spec: [8080/tcp]}
+      actions:
+        - {value: 0, label: No change}
+        - {value: 1, label: Allow in}
+        - {value: 2, label: Allow out}
+        - {value: 3, label: Allow in & out}
+        - {value: 4, label: Deny}
+
+    - id: custom_ports
+      label: Extra ports (one per line, port/proto:action)
+      type: list
+      default: []
+      pattern: "[0-9]{1,5}(-[0-9]{1,5})?/(tcp|udp):[0-4]"
+      placeholder: "8443/tcp:1"
+      help: Same 0-4 actions as above, e.g. 51820/udp:1 to allow WireGuard in.
+
+    - id: log_denied
+      label: Log denied packets
+      type: bool
+      default: true
+
+- id: packages
+  title: Package Management
+  intro: >
+    Reduces software sources and installation methods. Uses APT on
+    Ubuntu/Debian/Kali and DNF on Fedora/Rocky.
+  families: [debian, rhel]
+  options:
+    - id: enabled
+      label: Apply package management hardening
+      type: bool
+      default: false
+
+    - id: apt_disable_sources
+      label: APT source files to disable
+      type: list
+      families: [debian]
+      default: []
+      pattern: "[A-Za-z0-9._@+-]{1,100}\\.(list|sources)"
+      placeholder_from: sources_hint
+      help: File names under /etc/apt/sources.list.d, or sources.list.
+
+    - id: dnf_disable_repos
+      label: DNF repository IDs to disable
+      type: list
+      families: [rhel]
+      default: []
+      pattern: "[A-Za-z0-9._:+-]{1,100}"
+      placeholder_from: sources_hint
+      help: Repository IDs as shown by `dnf repolist`.
+
+    - id: remove_orphaned
+      label: Remove installed packages that no enabled source provides
+      type: bool
+      default: false
+      danger: true
+      help: Kernel packages are always kept. The list is printed and confirmed before removal.
+
+    - id: apt_disable_components
+      label: Disable optional components
+      type: multichoice
+      families: [debian]
+      default: []
+      choices_from: optional_components
+      help: Strips these components from every APT source.
+
+    - id: remove_fuse2
+      label: Remove the FUSE 2 compatibility library
+      type: bool
+      default: false
+      help: libfuse2t64 on Debian-family, fuse-libs on Fedora/Rocky. AppImages need it.
+
+    - id: remove_flatpak
+      label: Remove Flatpak apps and package, and block reinstall
+      type: bool
+      default: false
+      danger: true
+      help: On desktop installs this can also remove GNOME Software's Flatpak support.
+
+- id: apparmor
+  title: AppArmor
+  intro: >
+    Kernel-level mandatory access control for Ubuntu, Debian and Kali. Enforce
+    mode blocks actions that violate a profile. Complain mode only logs them,
+    which helps you check a profile before enforcing it.
+  families: [debian]
+  options:
+    - id: enabled
+      label: Configure AppArmor
+      type: bool
+      default: true
+
+    - id: install_core
+      label: Install core AppArmor packages
+      type: bool
+      default: true
+
+    - id: install_extra
+      label: Install extra community profiles
+      type: bool
+      default: false
+
+    - id: enable_boot
+      label: Enable kernel support at boot (GRUB)
+      type: bool
+      default: true
+      help: Only changes GRUB if the running kernel does not already have AppArmor active.
+
+    - id: start_service
+      label: Start the service now and enable it at boot
+      type: bool
+      default: true
+
+    - id: enforce_profiles
+      label: Profiles to enforce
+      type: list
+      default: []
+      pattern: "[A-Za-z0-9._@+-]{1,120}"
+      placeholder: usr.sbin.cupsd, usr.bin.man
+      help: File names under /etc/apparmor.d.
+
+    - id: complain_profiles
+      label: Profiles to set to complain mode
+      type: list
+      default: []
+      pattern: "[A-Za-z0-9._@+-]{1,120}"
+
+    - id: show_status
+      label: Show AppArmor status at the end
+      type: bool
+      default: true
+
+- id: selinux
+  title: SELinux
+  intro: >
+    Kernel-level mandatory access control for Fedora and Rocky. Enforcing
+    blocks policy violations. Permissive only logs them. Re-enabling a
+    disabled SELinux needs a filesystem relabel and a reboot.
+  families: [rhel]
+  options:
+    - id: enabled
+      label: Configure SELinux
+      type: bool
+      default: true
+
+    - id: install_tools
+      label: Install policy and management tools
+      type: bool
+      default: true
+
+    - id: mode
+      label: Mode
+      type: choice
+      default: enforcing
+      choices:
+        - {value: enforcing, label: Enforcing}
+        - {value: permissive, label: "Permissive (logs only)"}
+        - {value: unchanged, label: Leave unchanged}
+
+    - id: show_status
+      label: Show SELinux status at the end
+      type: bool
+      default: true
+
+- id: logging
+  title: Logging
+  intro: >
+    Installs `hc-logs`, an interactive terminal browser that lists this
+    machine's log sources (files in /var/log and the systemd journal), explains
+    what each one records, and opens it for reading.
+  families: [debian, rhel]
+  options:
+    - id: enabled
+      label: Configure logging
+      type: bool
+      default: true
+
+    - id: install_viewer
+      label: Install the hc-logs log browser
+      type: bool
+      default: true
+
+    - id: persistent_journal
+      label: Keep the systemd journal across reboots
+      type: bool
+      default: true
+
+    - id: install_rsyslog
+      label: Install rsyslog for classic text logs (auth.log, syslog, secure, messages)
+      type: bool
+      default: false
+      help: Debian 13 and Fedora log only to the journal by default.

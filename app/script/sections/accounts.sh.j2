@@ -1,0 +1,230 @@
+{% set acc = cfg.accounts %}
+# ------------------------------------------------------------------ accounts --
+# install_keys USER  - merge public keys from stdin into ~USER/.ssh/authorized_keys
+install_keys() {
+  local user=$1 home keys f
+  keys=$(cat)
+  home=$(home_of "$user")
+  f="$home/.ssh/authorized_keys"
+  { [ -f "$f" ] && cat "$f"; printf '%s\n' "$keys"; } | awk 'NF && !seen[$0]++' | write_file "$f" 0600
+  if (( HC_APPLY )) && [ -d "$home/.ssh" ]; then
+    chmod 700 "$home/.ssh"
+    chown -R "$user": "$home/.ssh"
+    command -v restorecon >/dev/null 2>&1 && restorecon -Rq "$home/.ssh" 2>/dev/null
+  fi
+}
+
+has_password() {
+  local h; h=$(getent shadow "$1" 2>/dev/null | cut -d: -f2)
+  [ -n "$h" ] && [[ $h != '!'* ]] && [[ $h != '*'* ]]
+}
+
+offer_password() {
+  local user=$1
+  has_password "$user" && return 0
+  (( HC_APPLY )) || { info "$user has no password yet; you would be asked to set one (sudo needs it)"; return 0; }
+  if hc_tty && confirm "Set a password for $user now? (needed for sudo)"; then
+    passwd "$user" </dev/tty || warn "password not set for $user"
+  else
+    warn "$user has no password, so it cannot use sudo yet. Run: sudo passwd $user"
+  fi
+}
+
+hc_accounts() {
+  section "User accounts & privileges"
+  local ADMIN_GROUP=$HC_ADMIN_GROUP
+
+{% if acc.new_admin_user %}
+  # Create the requested admin account.
+  local NEW={{ acc.new_admin_user|q }}
+  if id "$NEW" >/dev/null 2>&1; then
+    ok "account $NEW exists"
+  else
+    run useradd -m -s /bin/bash -G "$ADMIN_GROUP" "$NEW"
+  fi
+{% if acc.new_admin_keys %}
+  install_keys "$NEW" <<'HC_KEYS_EOF'
+{% for k in acc.new_admin_keys %}
+{{ k }}
+{% endfor %}
+HC_KEYS_EOF
+{% endif %}
+  offer_password "$NEW"
+{% else %}
+  # The research doc: prompt to create an account if root is the only user.
+  if [ -z "$(human_users)" ]; then
+    warn "root is the only login account on this system"
+    if (( HC_APPLY )) && hc_tty && confirm "Create an administrator account now?"; then
+      local NEW="" KEY=""
+      while ! [[ $NEW =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; do read -r -p "   Username: " NEW </dev/tty; done
+      run useradd -m -s /bin/bash -G "$ADMIN_GROUP" "$NEW"
+      HC_ADMINS+=("$NEW")
+      read -r -p "   Paste an SSH public key for $NEW (or leave empty): " KEY </dev/tty
+      if [[ $KEY =~ ^(ssh-|ecdsa-|sk-)[A-Za-z0-9@.-]+\ [A-Za-z0-9+/]+=*(\ .*)?$ ]]; then
+        printf '%s\n' "$KEY" | install_keys "$NEW"
+      elif [ -n "$KEY" ]; then
+        warn "that does not look like an SSH public key; skipped"
+      fi
+      offer_password "$NEW"
+    else
+      warn "Create an admin account before relying on SSH, since root login is disabled."
+    fi
+  fi
+{% endif %}
+
+  # Administrator group membership.
+{% if acc.all_admins %}
+  local u
+  for u in {{ acc.all_admins|qlist }}; do
+    if ! id "$u" >/dev/null 2>&1; then
+      (( HC_APPLY )) && warn "admin user $u does not exist; skipped" || info "admin user $u (created above or must exist)"
+      continue
+    fi
+    if id -nG "$u" | tr ' ' '\n' | grep -qx "$ADMIN_GROUP"; then ok "$u is in $ADMIN_GROUP"
+    else run usermod -aG "$ADMIN_GROUP" "$u"; fi
+  done
+{% endif %}
+{% if acc.restrict_sudo %}
+{% if acc.all_admins %}
+  local -a WANT=({{ acc.all_admins|qlist }})
+  local m
+  for m in $(getent group "$ADMIN_GROUP" | cut -d: -f4 | tr ',' ' '); do
+    in_list "$m" "${WANT[@]}" && continue
+    if [ -n "$HC_INVOKER" ] && [ "$m" = "$HC_INVOKER" ]; then
+      warn "$m is running this script, so it stays in $ADMIN_GROUP. Remove later with: gpasswd -d $m $ADMIN_GROUP"
+      continue
+    fi
+    run gpasswd -d "$m" "$ADMIN_GROUP"
+  done
+  # Grants that bypass the group are reported, not edited.
+  local grants
+  grants=$(grep -HnvE '^[[:space:]]*(#|$|Defaults|@include|@includedir|root[[:space:]]|%'"$ADMIN_GROUP"'[[:space:]]|[A-Z_]+_Alias)' \
+           /etc/sudoers /etc/sudoers.d/* 2>/dev/null | grep -E 'ALL' || true)
+  if [ -n "$grants" ]; then
+    warn "other sudo rules exist outside the $ADMIN_GROUP group; review them:"
+    printf '%s\n' "$grants" | sed 's/^/            /'
+  fi
+{% else %}
+  warn "no administrator users were listed, so $ADMIN_GROUP membership was left unchanged"
+{% endif %}
+{% endif %}
+
+{% if acc.lockout %}
+  # Account lockout with pam_faillock.
+  set_kv /etc/security/faillock.conf deny {{ acc.lockout_attempts }} " = "
+  set_kv /etc/security/faillock.conf unlock_time {{ acc.lockout_minutes * 60 }} " = "
+  set_kv /etc/security/faillock.conf fail_interval 900 " = "
+{% if os.family == "debian" %}
+  if grep -q pam_faillock /etc/pam.d/common-auth 2>/dev/null; then
+    ok "pam_faillock already enabled in PAM"
+  else
+    write_file /usr/share/pam-configs/hc-faillock <<'HC_EOF'
+Name: Lock accounts after failed logins (HardeningChef)
+Default: yes
+Priority: 0
+Auth-Type: Primary
+Auth:
+	[default=die]	pam_faillock.so authfail
+HC_EOF
+    write_file /usr/share/pam-configs/hc-faillock-notify <<'HC_EOF'
+Name: Count failed logins and reset on success (HardeningChef)
+Default: yes
+Priority: 1024
+Auth-Type: Primary
+Auth:
+	requisite	pam_faillock.so preauth
+Account-Type: Primary
+Account:
+	required	pam_faillock.so
+HC_EOF
+    run pam-auth-update --package --enable hc-faillock hc-faillock-notify
+  fi
+{% else %}
+  if ! command -v authselect >/dev/null 2>&1; then
+    warn "authselect not installed; enable pam_faillock in /etc/pam.d manually"
+  elif ! authselect current >/dev/null 2>&1; then
+    warn "PAM is not managed by authselect; enable pam_faillock manually"
+  elif authselect current | grep -q with-faillock; then
+    ok "authselect feature with-faillock already enabled"
+  else
+    run authselect enable-feature with-faillock && run authselect apply-changes
+  fi
+{% endif %}
+{% endif %}
+
+  # Password length (pam_pwquality).
+{% if os.family == "debian" %}
+  pkg_install libpam-pwquality
+{% else %}
+  pkg_install libpwquality
+{% endif %}
+  set_kv /etc/security/pwquality.conf minlen {{ acc.min_password_length }} " = "
+
+  # Password age.
+  set_kv /etc/login.defs PASS_MAX_DAYS {{ acc.max_password_age }}
+{% if acc.password_age_existing %}
+  local today user hash last max
+  today=$(( $(date +%s) / 86400 ))
+  local -a humans; mapfile -t humans < <(human_users)
+  while IFS=: read -r user hash last _ max _; do
+    in_list "$user" "${humans[@]}" || continue
+    [ -n "$hash" ] && [[ $hash != '!'* ]] && [[ $hash != '*'* ]] || continue
+    [ "$max" = "{{ acc.max_password_age }}" ] || run chage -M {{ acc.max_password_age }} "$user"
+    if [[ $last =~ ^[0-9]+$ ]] && (( last > 0 && today - last > {{ acc.max_password_age }} )); then
+      warn "$user's password is $((today - last)) days old and must be changed at next login"
+    fi
+  done < <(getent shadow 2>/dev/null)
+{% endif %}
+
+{% if acc.disable_inactive %}
+  # Disable inactive non-admin accounts (daily timer).
+  write_file /usr/local/sbin/hc-inactive-accounts 0755 <<'HC_INACTIVE_EOF'
+{{ hc_inactive }}
+HC_INACTIVE_EOF
+  write_file /etc/systemd/system/hc-inactive-accounts.service <<'HC_EOF'
+[Unit]
+Description=HardeningChef: disable inactive non-admin accounts
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/hc-inactive-accounts
+HC_EOF
+  write_file /etc/systemd/system/hc-inactive-accounts.timer <<'HC_EOF'
+[Unit]
+Description=HardeningChef: daily inactive account check
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+HC_EOF
+  svc daemon-reload
+  svc enable --now hc-inactive-accounts.timer
+  if (( HC_APPLY )); then
+    info "accounts that would be disabled today:"
+    /usr/local/sbin/hc-inactive-accounts --report | sed 's/^/            /'
+  fi
+{% endif %}
+
+  # Default umask.
+  set_kv /etc/login.defs UMASK {{ acc.umask }}
+  write_file /etc/profile.d/hardeningchef-umask.sh <<'HC_EOF'
+# Managed by HardeningChef: default permissions for new files.
+umask {{ acc.umask }}
+HC_EOF
+{% if os.family == "rhel" %}
+  # Fedora/Rocky set umask again in /etc/bashrc and /etc/profile.
+  local f
+  for f in /etc/bashrc /etc/profile; do
+    if grep -qE '^[[:space:]]*umask[[:space:]]+[0-7]{3,4}' "$f" 2>/dev/null; then
+      sed -E 's/^([[:space:]]*)umask[[:space:]]+[0-7]{3,4}/\1umask {{ acc.umask }}/' "$f" | write_file "$f" "$(stat -c %a "$f")"
+    fi
+  done
+{% else %}
+  grep -q pam_umask /etc/pam.d/common-session 2>/dev/null || warn "pam_umask not in /etc/pam.d/common-session; UMASK applies to login shells only"
+{% endif %}
+  return 0
+}
